@@ -20,7 +20,8 @@ pub(crate) fn advertisement() -> Vec<u8> {
     pktline::line(&mut out, "version 2\n");
     pktline::line(&mut out, &format!("agent={AGENT}\n"));
     pktline::line(&mut out, "ls-refs=unborn\n");
-    pktline::line(&mut out, "fetch=shallow filter\n");
+    // `git push` with `push.negotiate` sends `wait-for-done` only when the server advertises it.
+    pktline::line(&mut out, "fetch=shallow filter wait-for-done\n");
     pktline::line(&mut out, "object-format=sha1\n");
     pktline::flush(&mut out);
     out
