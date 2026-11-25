@@ -7,9 +7,9 @@ use tonic::{Request, Response, Status};
 use enroute_api::api::v1alpha1::object_service_server::ObjectService;
 use enroute_api::api::v1alpha1::{
     Commit, DiffCommitRequest, DiffCommitResponse, FileChange, FindMergeBasesRequest,
-    FindMergeBasesResponse, GetObjectRequest, GetObjectResponse, Identity, ListCommitsRequest,
-    ListCommitsResponse, ListTreeRequest, ListTreeResponse, ObjectHeader, ObjectKind, TreeEntry,
-    get_object_response,
+    FindMergeBasesResponse, GetObjectRequest, GetObjectResponse, Hunk, Identity, LineSketch,
+    ListCommitsRequest, ListCommitsResponse, ListTreeRequest, ListTreeResponse, ObjectHeader,
+    ObjectKind, TreeEntry, get_object_response,
 };
 
 use crate::contract::wire::{parse_hex, parse_oid, require_oid, wire_oid, wire_time};
@@ -78,7 +78,7 @@ impl ObjectService for Api {
         let request = request.into_inner();
         let (_, snap) = self.snapshot(request.repo.as_ref()).await?;
         let oid = require_oid(request.object_id.as_ref(), "object_id")?;
-        let walk = query::list_tree(&snap, oid).await?;
+        let walk = query::list_tree(&snap, oid, &request.start_after).await?;
         let mut batches: Vec<ListTreeResponse> = walk
             .levels
             .into_iter()
@@ -99,10 +99,12 @@ impl ObjectService for Api {
                 truncated: false,
             })
             .collect();
-        if walk.truncated
-            && let Some(last) = batches.last_mut()
-        {
-            last.truncated = true;
+        match batches.last_mut() {
+            Some(last) => last.truncated = walk.truncated,
+            None => batches.push(ListTreeResponse {
+                entries: Vec::new(),
+                truncated: walk.truncated,
+            }),
         }
         Ok(Response::new(streamed(batches)))
     }
@@ -153,7 +155,24 @@ impl ObjectService for Api {
         let (_, snap) = self.snapshot(request.repo.as_ref()).await?;
         let oid = require_oid(request.commit_id.as_ref(), "commit_id")?;
         let base = request.base_commit_id.as_ref().map(parse_oid).transpose()?;
-        let diff = query::diff_commit(&snap, oid, base).await?;
+        if let Some(sketches) = &request.sketches
+            && sketches.version != query::SKETCH_VERSION
+        {
+            return Err(Status::invalid_argument(format!(
+                "sketch version {} is not known; this server computes version {}",
+                sketches.version,
+                query::SKETCH_VERSION
+            )));
+        }
+        let options = query::DiffOptions {
+            paths: (!request.paths.is_empty())
+                .then(|| query::PathFilter::new(request.paths.into_iter().map(String::into_bytes))),
+            hunks: request.hunks.map(|hunks| hunks.max_blob_bytes),
+            sketch_hashes: request
+                .sketches
+                .map(|sketches| query::DiffOptions::sketch_size(sketches.k)),
+        };
+        let diff = query::diff_commit(&snap, oid, base, options).await?;
         let mut batches: Vec<DiffCommitResponse> = diff
             .changes
             .chunks(DIFF_BATCH_CHANGES)
@@ -162,8 +181,25 @@ impl ObjectService for Api {
                     .iter()
                     .map(|change| FileChange {
                         path: lossy(&change.path),
-                        old_object_id: change.old.map(wire_oid),
-                        new_object_id: change.new.map(wire_oid),
+                        old_object_id: change.old.map(|blob| wire_oid(blob.oid)),
+                        new_object_id: change.new.map(|blob| wire_oid(blob.oid)),
+                        old_size: change.old.map(|blob| blob.size),
+                        new_size: change.new.map(|blob| blob.size),
+                        hunks: change
+                            .hunks
+                            .iter()
+                            .map(|hunk| Hunk {
+                                old_start: hunk.old.start,
+                                old_end: hunk.old.end,
+                                new_start: hunk.new.start,
+                                new_end: hunk.new.end,
+                            })
+                            .collect(),
+                        content_skipped: change.content_skipped,
+                        sketch: change.sketch.as_ref().map(|sketch| LineSketch {
+                            smallest_hashes: sketch.smallest_hashes.clone(),
+                            distinct_lines: sketch.distinct_lines,
+                        }),
                     })
                     .collect(),
                 truncated: false,

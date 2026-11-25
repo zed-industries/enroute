@@ -200,6 +200,9 @@ futures = "0.3"
 roaring = "0.11"
 # Persistent maps: a state copy shares its refs.
 rpds = "1"
+# Hunks are API output, and another version can choose different ones.
+imara-diff = { version = "=0.2.0", default-features = false }
+xxhash-rust = { version = "0.8", features = ["xxh3"] }
 
 # http server
 axum = { version = "0.8", features = ["macros"] }

@@ -474,6 +474,9 @@ impl Client {
                 repo: Some(repo_key(repo)),
                 commit_id: oid(object_id),
                 base_commit_id: oid(base),
+                paths: Vec::new(),
+                hunks: None,
+                sketches: None,
             })
             .await
             .context("calling diff_commit")?
@@ -505,6 +508,7 @@ impl Client {
             .list_tree(ListTreeRequest {
                 repo: Some(repo_key(repo)),
                 object_id: oid(object_id),
+                start_after: String::new(),
             })
             .await
             .context("calling list_tree")?

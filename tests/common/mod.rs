@@ -344,6 +344,7 @@ impl Api {
             .list_tree(api::ListTreeRequest {
                 repo: Some(key(repo)),
                 object_id: Some(ObjectId { hex: tip }),
+                start_after: String::new(),
             })
             .await?
             .into_inner();

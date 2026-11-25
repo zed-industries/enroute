@@ -53,6 +53,10 @@ message ListTreeRequest {
   // A commit or a tree. A commit is resolved to its root tree, so a caller
   // holding a branch tip needs no round trip to turn it into one.
   common.v1alpha1.ObjectId object_id = 2;
+
+  // Resume after this path: the last `TreeEntry.path` of a response that set
+  // `truncated`. Empty starts at the root.
+  string start_after = 3;
 }
 
 // One path under the tree.
@@ -75,11 +79,14 @@ message TreeEntry {
 }
 
 // Entries arrive in batches, breadth first: everything at one depth before
-// anything below it. Order within a depth is not promised.
+// anything below it, and within a depth in order of `path`.
 //
 // `truncated` is set when the walk stopped at the server's limit, and the
 // entries already sent are then a prefix of the answer rather than the whole
-// of it. A caller that must not draw a partial tree has to check it.
+// of it. A caller that must not draw a partial tree has to check it. To read
+// on, call again with `start_after` set to the last path received. Each call
+// walks again the directories above where it starts, so paging holds no
+// state on the server.
 message ListTreeResponse {
   repeated TreeEntry entries = 1;
   bool truncated = 2;
@@ -212,6 +219,42 @@ message DiffCommitRequest {
   // and holds no opinion about how they are related, as `IsAncestor` reports
   // ancestry without imposing it.
   common.v1alpha1.ObjectId base_commit_id = 3;
+
+  // Report only changes at these paths. Each path matches one file exactly,
+  // so a directory's path does not select the files under it. Empty reports
+  // every path.
+  //
+  // Trees off these paths are not read, so a caller that knows which files
+  // it wants pays for those files only.
+  repeated string paths = 4;
+
+  // Report each change's line hunks.
+  HunkOptions hunks = 5;
+
+  // Report a line sketch of each added or deleted file.
+  SketchOptions sketches = 6;
+}
+
+message HunkOptions {
+  // Skip blobs larger than this. Zero uses the server's limit, which also
+  // caps a larger value.
+  uint64 max_blob_bytes = 1;
+}
+
+// A bottom-k MinHash sketch of a file's distinct lines, to estimate how alike
+// two files are without reading them. Two sketches estimate the Jaccard index
+// of the files' line sets: https://en.wikipedia.org/wiki/Jaccard_index and
+// https://en.wikipedia.org/wiki/MinHash.
+//
+// Version 1: split at `\n`, trim ASCII whitespace, skip lines with fewer than
+// 3 non-whitespace bytes, hash each distinct line with xxh3-64, and keep the
+// `k` smallest hashes. A new version is a new definition, so sketches compare
+// only within one.
+message SketchOptions {
+  // An unknown version is refused.
+  uint32 version = 1;
+  // Hashes to keep. Clamped to a server limit.
+  uint32 k = 2;
 }
 
 // One path this commit changed, as the pair of blobs at it.
@@ -231,6 +274,39 @@ message FileChange {
   // an add of the paths under it, because there is no pair of blobs to name.
   common.v1alpha1.ObjectId old_object_id = 2;
   common.v1alpha1.ObjectId new_object_id = 3;
+
+  // Bytes of each blob, set exactly when its object ID is, so an empty blob
+  // reads as zero and a missing one as unset.
+  optional uint64 old_size = 4;
+  optional uint64 new_size = 5;
+
+  // The Myers line diff from the old blob to the new, with
+  // `DiffCommitRequest.hunks`. An add is one hunk of the whole new blob and a
+  // delete one hunk of the whole old blob.
+  repeated Hunk hunks = 6;
+  // The blobs were not diffed or sketched: one is binary, not UTF-8, or past
+  // the size limit, or the request reached the server's read limit.
+  bool content_skipped = 7;
+
+  // With `DiffCommitRequest.sketches`: the added blob's sketch, or the
+  // deleted blob's.
+  LineSketch sketch = 8;
+}
+
+// Bytes `old_start..old_end` of the old blob became `new_start..new_end` of
+// the new. Both ranges are whole lines, and either can be empty.
+message Hunk {
+  uint64 old_start = 1;
+  uint64 old_end = 2;
+  uint64 new_start = 3;
+  uint64 new_end = 4;
+}
+
+message LineSketch {
+  // Ascending.
+  repeated uint64 smallest_hashes = 1;
+  // How many distinct lines counted, which can exceed the hashes kept.
+  uint32 distinct_lines = 2;
 }
 
 // Changes arrive in batches, ordered by path across the whole answer.

@@ -67,9 +67,9 @@ It answers:
 |                     | `UpdateRefs`       | One outcome per update. Each lands or fails on its own.        |
 |                     | `IsAncestor`       | Whether one commit is in another's history.                    |
 | `ObjectService`     | `GetObject`        | A stream: one header, then the bytes.                          |
-|                     | `ListTree`         | A stream of paths under a commit or tree.                      |
+|                     | `ListTree`         | A stream of paths under a commit or tree, paged by `start_after`. |
 |                     | `ListCommits`      | A stream of commits, newest first, paged.                      |
-|                     | `DiffCommit`       | A stream of changed paths, as blob id pairs.                   |
+|                     | `DiffCommit`       | A stream of changed paths, as blob id pairs, with optional line hunks and sketches. |
 |                     | `FindMergeBases`   | Where two histories last agreed, as a set, in no defined order.     |
 | `SyncService`       | `PushToRemote`     | One outcome per ref sent to another Git server.                |
 |                     | `FetchFromRemote`  | Refs under prefixes made to match another Git server; changed refs only. |
@@ -141,7 +141,8 @@ landed there since reads as a reversion.
 
 **Check `truncated` and `exhausted`.** `ListTree` and `DiffCommit` set
 `truncated` when they stopped at a server limit, and what arrived is then the
-first part of the answer. `FindMergeBases` sets `exhausted` to mean "unknown",
+first part of the answer. Resume `ListTree` with `start_after` set to the last
+path. `FindMergeBases` sets `exhausted` to mean "unknown",
 not "no shared history".
 
 ## Generating a client

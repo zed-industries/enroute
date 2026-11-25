@@ -117,7 +117,7 @@ so with a flag. Check the flag before you present a result as complete.
 | --- | --- | --- |
 | `ListRepositories` | 100 repositories per page | `next_page_token` |
 | `ListCommits` | 100 commits per page | `next_page_token` |
-| `ListTree` | 50,000 entries | `truncated` |
+| `ListTree` | 50,000 entries per page | `truncated`; resume with `start_after` |
 | `DiffCommit` | 50,000 changes, or 10,000 tree reads | `truncated` |
 | `FindMergeBases` | 250,000 commits walked | `exhausted` |
 | `CreateCommit` | 32 MiB per request | `OUT_OF_RANGE` |
@@ -565,13 +565,14 @@ Streams every path under a tree, recursively.
 | --- | --- | --- |
 | `repo` | `RepoKey` | Required. The key of the repository. |
 | `object_id` | `ObjectId` | Required. A commit or a tree. A commit means its root tree. |
+| `start_after` | `string` | The last path of a truncated response. The listing resumes after it. Empty starts at the root. |
 
 The response is a stream of batches.
 
 | Field | Type | Description |
 | --- | --- | --- |
 | `entries` | `TreeEntry[]` | The next batch of entries. |
-| `truncated` | `bool` | The walk stopped at 50,000 entries. The entries sent are a part of the tree. |
+| `truncated` | `bool` | The page stopped at 50,000 entries. Call again with the last path as `start_after` for the rest. |
 
 | `TreeEntry` field | Type | Description |
 | --- | --- | --- |
@@ -580,7 +581,10 @@ The response is a stream of batches.
 | `object_id` | `ObjectId` | The blob or the tree. |
 
 - **Breadth first.** Every entry at one depth arrives before any entry below
-  it. Order within a depth is not defined.
+  it. Within a depth, entries are in byte order of their path.
+- **Stateless pages.** Each page walks again the trees above where it starts.
+  A page never ends between two paths that read the same, which a lossy
+  decoding of non-UTF-8 names can make of different names.
 - **Directories too.** A directory is an entry as well as the files in it.
 - **No submodules.** A submodule entry (a gitlink) is left out.
 - **No mode and no size.** `ListTree` reads trees only, so its cost grows with
@@ -720,6 +724,18 @@ each side.
 | `repo` | `RepoKey` | Required. The key of the repository. |
 | `commit_id` | `ObjectId` | Required. The commit to diff. |
 | `base_commit_id` | `ObjectId` | The commit to diff against. Unset means the first parent of `commit_id`. |
+| `paths` | `string[]` | Report only changes at these paths. Each path matches one file exactly, so a directory's path does not select the files under it. Empty reports every path. |
+| `hunks` | `HunkOptions` | Report each change's line hunks. |
+| `sketches` | `SketchOptions` | Report a line sketch of each added and deleted file. |
+
+| `HunkOptions` field | Type | Description |
+| --- | --- | --- |
+| `max_blob_bytes` | `uint64` | Skip blobs larger than this. Zero, or more than the server's 16 MiB limit, means 16 MiB. |
+
+| `SketchOptions` field | Type | Description |
+| --- | --- | --- |
+| `version` | `uint32` | Required. The sketch definition. Only version 1 exists. |
+| `k` | `uint32` | The most hashes in a sketch, at most 1,024. |
 
 The response is a stream of batches.
 
@@ -733,6 +749,21 @@ The response is a stream of batches.
 | `path` | `string` | The path from the root of the tree. |
 | `old_object_id` | `ObjectId` | The blob in the base. Unset when the commit adds the path. |
 | `new_object_id` | `ObjectId` | The blob in the commit. Unset when the commit deletes the path. |
+| `old_size` | `uint64` | The size of the old blob. Set exactly when `old_object_id` is. |
+| `new_size` | `uint64` | The size of the new blob. Set exactly when `new_object_id` is. |
+| `hunks` | `Hunk[]` | With `hunks`: byte ranges of whole lines, old and new, that a Myers line diff changed. An add or a delete is one hunk of the whole file. |
+| `content_skipped` | `bool` | Hunks or a sketch were asked for and not computed: the blob is binary, not UTF-8, or too large, or the request read 256 MiB of blobs. |
+| `sketch` | `LineSketch` | With `sketches`, for an add or a delete. |
+
+| `LineSketch` field | Type | Description |
+| --- | --- | --- |
+| `smallest_hashes` | `uint64[]` | The `k` smallest distinct line hashes, ascending. |
+| `distinct_lines` | `uint32` | How many distinct lines the sketch hashed. |
+
+Version 1 splits a file at `\n`, trims ASCII whitespace from each line, skips
+lines with fewer than 3 non-whitespace bytes, and hashes each distinct line with
+XXH3-64. Two sketches estimate the [Jaccard
+index](https://en.wikipedia.org/wiki/Jaccard_index) of their files' line sets.
 
 - **What a commit changed.** With no `base_commit_id`, the diff is against the
   first parent. A merge then shows what it landed on the branch, not
@@ -746,8 +777,8 @@ The response is a stream of batches.
   and a change to a submodule are not reported.
 - **File to directory.** A path that changed between a file and a directory
   is a delete and an add of the paths under it.
-- **No contents.** Read each blob with `GetObject`, and compute the line diff
-  in your application.
+- **Contents on request.** Without `hunks`, read each blob with `GetObject`
+  and compute the line diff in your application.
 
 | Status | Cause |
 | --- | --- |

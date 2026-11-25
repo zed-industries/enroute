@@ -33,6 +33,7 @@ gix-date.workspace = true
 gix-hash.workspace = true
 gix-object.workspace = true
 gix-validate.workspace = true
+imara-diff.workspace = true
 integer-encoding.workspace = true
 rand.workspace = true
 rayon.workspace = true
@@ -60,6 +61,7 @@ tonic.workspace = true
 tonic-reflection.workspace = true
 tracing.workspace = true
 url.workspace = true
+xxhash-rust.workspace = true
 zerocopy.workspace = true
 
 [dev-dependencies]

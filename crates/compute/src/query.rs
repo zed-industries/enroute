@@ -11,7 +11,11 @@
 //!   the push numbered them in (bases from different pushes keep push order).
 
 mod commit;
+mod diff_content;
 mod refs;
+
+use std::collections::BTreeSet;
+use std::ops::Bound;
 
 use foldhash::{HashMap, HashMapExt, HashSet, HashSetExt};
 use std::fmt;
@@ -41,6 +45,17 @@ pub(crate) const DIFF_CHANGE_LIMIT: usize = 50_000;
 
 /// Trees one diff reads before it stops and reports what it has.
 const DIFF_TREE_READ_LIMIT: usize = 10_000;
+
+/// Bytes of one blob a diff reads to hunk or sketch it, at most.
+const DIFF_BLOB_LIMIT: u64 = 16 * 1024 * 1024;
+
+/// Blob bytes one diff reads to hunk or sketch, at most. Past it, changes
+/// are still listed, with their content skipped.
+const DIFF_CONTENT_READ_LIMIT: u64 = 256 * 1024 * 1024;
+
+/// Blob bytes a diff holds at once to hunk or sketch them. The largest pair
+/// one change can read fits.
+const DIFF_CONTENT_CHUNK_BYTES: u64 = 2 * DIFF_BLOB_LIMIT;
 
 /// Commits one merge-base walk reads before it stops.
 const MERGE_BASE_MAX_COMMITS: u64 = 250_000;
@@ -308,53 +323,94 @@ pub(crate) struct TreeItem {
     pub is_tree: bool,
 }
 
-/// Every path under a tree, one level per depth.
+/// One page of the paths under a tree, one level per depth.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct TreeListing {
-    /// Breadth first.
+    /// Breadth first, each level sorted by path.
     pub levels: Vec<Vec<TreeItem>>,
-    /// The listing stopped at its entry limit with more to name.
+    /// The page stopped at its entry limit with more to name.
     pub truncated: bool,
 }
 
-/// Every path under `start` (a tree, or a commit's root tree), breadth first,
-/// at most `entry_limit` of them; gitlinks are left out.
+/// Paths under `start` (a tree, or a commit's root tree) that come after
+/// `start_after`, breadth first, at most [`TREE_ENTRY_LIMIT`] of them;
+/// gitlinks are left out.
+///
+/// A depth's entries are sorted by their path as the API sends it, so a
+/// listing is in order of depth, then path, and the last path of one page is
+/// where the next starts. A page does not end between paths that read the
+/// same, which a lossy decoding can make of different names. Each page walks
+/// again the levels above its first entry, so it holds no state between
+/// calls.
 ///
 /// # Errors
 ///
 /// `start` is not a stored tree or commit, or a read failed.
-pub(crate) async fn list_tree(snap: &Arc<Snapshot>, start: Oid) -> Result<TreeListing, Error> {
+pub(crate) async fn list_tree(
+    snap: &Arc<Snapshot>,
+    start: Oid,
+    start_after: &str,
+) -> Result<TreeListing, Error> {
     let root = root_tree(snap, start).await?;
+    // An empty `start_after` starts before every path, at depth 0.
+    let start_depth = start_after.matches('/').count();
     let mut trees: HashMap<Oid, Vec<Child>> = HashMap::new();
-    let mut seen: HashSet<Oid> = HashSet::from_iter([root]);
-    let mut frontier = vec![root];
-    read_trees(snap, &frontier, &mut trees).await?;
-    let mut found = 1usize;
-    // Every distinct tree, a level at a time, until a level takes the count
-    // past the limit, so the truncation point does not depend on walk order.
-    loop {
-        let next: Vec<Oid> = frontier
+    let mut walk = TreeListing::default();
+    let mut named = 0usize;
+    let mut directories: Vec<(Vec<u8>, Oid)> = vec![(Vec::new(), root)];
+    for depth in 0.. {
+        if directories.is_empty() {
+            break;
+        }
+        let unread: Vec<Oid> = directories
             .iter()
-            .filter_map(|t| trees.get(t))
-            .flatten()
-            .filter(|c| c.is_tree && seen.insert(c.oid))
-            .map(|c| c.oid)
+            .map(|(_, oid)| *oid)
+            .filter(|oid| !trees.contains_key(oid))
+            .collect::<HashSet<_>>()
+            .into_iter()
             .collect();
-        if next.is_empty() {
-            break;
+        read_trees(snap, &unread, &mut trees).await?;
+        let mut entries: Vec<(String, TreeItem)> = directories
+            .iter()
+            .filter_map(|(prefix, oid)| Some((prefix, trees.get(oid)?)))
+            .flat_map(|(prefix, children)| {
+                children.iter().filter(|c| !c.is_commit).map(|c| {
+                    let path = join(prefix, &c.name);
+                    let item = TreeItem {
+                        path,
+                        oid: c.oid,
+                        is_tree: c.is_tree,
+                    };
+                    (String::from_utf8_lossy(&item.path).into_owned(), item)
+                })
+            })
+            .collect();
+        entries.sort_by(|(left, _), (right, _)| left.cmp(right));
+        directories = entries
+            .iter()
+            .filter(|(_, item)| item.is_tree)
+            .map(|(_, item)| (item.path.clone(), item.oid))
+            .collect();
+        let listed = entries.into_iter().filter(|(key, _)| {
+            depth > start_depth || depth == start_depth && key.as_str() > start_after
+        });
+        let mut level = Vec::new();
+        let mut last: Option<String> = None;
+        for (key, item) in listed {
+            if named >= TREE_ENTRY_LIMIT && last.as_ref() != Some(&key) {
+                walk.levels.push(level);
+                walk.truncated = true;
+                return Ok(walk);
+            }
+            named += 1;
+            level.push(item);
+            last = Some(key);
         }
-        read_trees(snap, &next, &mut trees).await?;
-        found += next.len();
-        if found > TREE_ENTRY_LIMIT {
-            break;
+        if !level.is_empty() {
+            walk.levels.push(level);
         }
-        frontier = next;
     }
-    Ok(
-        tokio::task::spawn_blocking(move || levels(&trees, root, TREE_ENTRY_LIMIT))
-            .await
-            .map_err(anyhow::Error::from)?,
-    )
+    Ok(walk)
 }
 
 /// The tree a listing starts at.
@@ -371,53 +427,78 @@ async fn root_tree(snap: &Arc<Snapshot>, start: Oid) -> Result<Oid, Error> {
     }
 }
 
-/// The paths under `root` in the trees read: a tree that was not read ends its
-/// branch quietly.
-fn levels(trees: &HashMap<Oid, Vec<Child>>, root: Oid, entry_limit: usize) -> TreeListing {
-    let mut walk = TreeListing::default();
-    let mut level: Vec<(Vec<u8>, Oid)> = vec![(Vec::new(), root)];
-    let mut named = 0usize;
-    while !level.is_empty() {
-        let mut entries = Vec::new();
-        let mut next = Vec::new();
-        for (prefix, oid) in level {
-            let Some(children) = trees.get(&oid) else {
-                continue;
-            };
-            for c in children.iter().filter(|c| !c.is_commit) {
-                let path = join(&prefix, &c.name);
-                next.extend(c.is_tree.then(|| (path.clone(), c.oid)));
-                entries.push(TreeItem {
-                    path,
-                    oid: c.oid,
-                    is_tree: c.is_tree,
-                });
-            }
-        }
-        if named + entries.len() > entry_limit {
-            entries.truncate(entry_limit.saturating_sub(named));
-            walk.levels.push(entries);
-            walk.truncated = true;
-            return walk;
-        }
-        named += entries.len();
-        if !entries.is_empty() {
-            walk.levels.push(entries);
-        }
-        level = next;
-    }
-    walk
-}
-
 /// One file a diff found changed.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct FileChange {
     /// From the root, `/`-joined, in git's raw bytes.
     pub path: Vec<u8>,
     /// The blob before; `None` when the path is new.
-    pub old: Option<Oid>,
+    pub old: Option<ChangedBlob>,
     /// The blob after; `None` when the path is gone.
-    pub new: Option<Oid>,
+    pub new: Option<ChangedBlob>,
+    /// With [`DiffOptions::hunks`].
+    pub hunks: Vec<Hunk>,
+    /// Hunks or a sketch were asked for and not computed.
+    pub content_skipped: bool,
+    /// With [`DiffOptions::sketch_hashes`], for an add or a delete.
+    pub sketch: Option<LineSketch>,
+}
+
+/// One side of a [`FileChange`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ChangedBlob {
+    pub oid: Oid,
+    pub size: u64,
+}
+
+pub(crate) use diff_content::{Hunk, LineSketch, SKETCH_VERSION};
+
+/// What a diff reports beyond the changed paths.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct DiffOptions {
+    /// Only these paths, and only the trees that hold them.
+    pub paths: Option<PathFilter>,
+    /// Line hunks, skipping blobs past this many bytes.
+    pub hunks: Option<u64>,
+    /// Version 1 line sketches of added and deleted files, with this many hashes.
+    pub sketch_hashes: Option<usize>,
+}
+
+impl DiffOptions {
+    /// Clamps the caller's sketch size to the server's limit.
+    pub(crate) fn sketch_size(k: u32) -> usize {
+        usize::try_from(k)
+            .unwrap_or(usize::MAX)
+            .clamp(1, diff_content::MAX_SKETCH_HASHES)
+    }
+}
+
+/// A set of file paths, and the directories that hold them.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct PathFilter(BTreeSet<Vec<u8>>);
+
+impl PathFilter {
+    pub(crate) fn new(paths: impl IntoIterator<Item = Vec<u8>>) -> Self {
+        Self(paths.into_iter().collect())
+    }
+
+    fn has_file(&self, path: &[u8]) -> bool {
+        self.0.contains(path)
+    }
+
+    fn has_under(&self, directory: &[u8]) -> bool {
+        // Siblings that continue `directory` with a byte below `/`, such as
+        // `directory.rs`, sort between it and the paths under it.
+        self.0
+            .range::<[u8], _>((Bound::Included(directory), Bound::Unbounded))
+            .take_while(|path| path.starts_with(directory))
+            .find_map(|path| match path.get(directory.len()) {
+                Some(b'/') => Some(true),
+                Some(byte) if *byte > b'/' => Some(false),
+                _ => None,
+            })
+            .unwrap_or(false)
+    }
 }
 
 /// The files that differ between two commits.
@@ -442,6 +523,7 @@ pub(crate) async fn diff_commit(
     snap: &Arc<Snapshot>,
     commit: Oid,
     base: Option<Oid>,
+    options: DiffOptions,
 ) -> Result<CommitDiff, Error> {
     const OF: &str = "a diff is of a commit";
     let older = if let Some(base) = base {
@@ -467,8 +549,157 @@ pub(crate) async fn diff_commit(
         Some(o) => Some(commit_tree(snap, o).await?),
         None => None,
     };
-    let diff = diff_trees(snap, old_root, new_root).await?;
-    Ok(changed_files(diff))
+    let filter = options.paths.clone().map(Arc::new);
+    let diff = diff_trees(snap, old_root, new_root, filter.clone()).await?;
+    let (paths, truncated) = changed_files(diff, filter.as_deref());
+    let changes = add_content(snap, paths, &options).await?;
+    Ok(CommitDiff { changes, truncated })
+}
+
+/// Reads each path's blob sizes, and hunks and sketches when `options` asks
+/// for them.
+async fn add_content(
+    snap: &Arc<Snapshot>,
+    paths: Vec<ChangedPath>,
+    options: &DiffOptions,
+) -> Result<Vec<FileChange>> {
+    let blob_limit = options
+        .hunks
+        .filter(|limit| *limit > 0)
+        .map_or(DIFF_BLOB_LIMIT, |limit| limit.min(DIFF_BLOB_LIMIT));
+    let want_hunks = options.hunks.is_some();
+    let mut budget = DIFF_CONTENT_READ_LIMIT;
+    // TODO: Report a blob that a tree names but the snapshot lacks as an
+    // error. It now reads as empty, with size zero.
+    let stored = |oid: Oid| {
+        let stored = snap.lookup_kind(&oid, Kind::Blob);
+        let size = stored.map_or(0, |d| snap.size(d));
+        (ChangedBlob { oid, size }, stored)
+    };
+    let mut changes = Vec::with_capacity(paths.len());
+    let mut chunk = Vec::new();
+    let mut chunk_bytes = 0;
+    for ChangedPath { path, old, new } in paths {
+        let (old, new) = (old.map(stored), new.map(stored));
+        let mut change = FileChange {
+            path,
+            old: old.map(|(blob, _)| blob),
+            new: new.map(|(blob, _)| blob),
+            ..FileChange::default()
+        };
+        let (old, new) = (old.and_then(|(_, d)| d), new.and_then(|(_, d)| d));
+        let old_size = change.old.map_or(0, |blob| blob.size);
+        let new_size = change.new.map_or(0, |blob| blob.size);
+        let sketch = options
+            .sketch_hashes
+            .filter(|_| change.old.is_none() || change.new.is_none());
+        let total = old_size + new_size;
+        let wanted = want_hunks || sketch.is_some();
+        if wanted && (old_size > blob_limit || new_size > blob_limit || total > budget) {
+            change.content_skipped = true;
+        } else if wanted {
+            budget -= total;
+            if chunk_bytes + total > DIFF_CONTENT_CHUNK_BYTES {
+                read_content(snap, &mut changes, std::mem::take(&mut chunk), want_hunks).await?;
+                chunk_bytes = 0;
+            }
+            chunk_bytes += total;
+            chunk.push(ContentRead {
+                change: changes.len(),
+                old,
+                new,
+                sketch,
+            });
+        }
+        changes.push(change);
+    }
+    read_content(snap, &mut changes, chunk, want_hunks).await?;
+    Ok(changes)
+}
+
+/// One change whose blobs [`read_content`] reads.
+struct ContentRead {
+    /// Its index in the changes.
+    change: usize,
+    old: Option<DenseId>,
+    new: Option<DenseId>,
+    sketch: Option<usize>,
+}
+
+/// Loads a chunk's blobs together, then computes their hunks and sketches on
+/// one blocking thread, so a diff of many files waits on neither one load nor
+/// one task per file.
+async fn read_content(
+    snap: &Arc<Snapshot>,
+    changes: &mut [FileChange],
+    chunk: Vec<ContentRead>,
+    want_hunks: bool,
+) -> Result<()> {
+    if chunk.is_empty() {
+        return Ok(());
+    }
+    let blobs = snap
+        .load_many(
+            chunk
+                .iter()
+                .flat_map(|read| read.old.into_iter().chain(read.new)),
+        )
+        .await?;
+    let computed = tokio::task::spawn_blocking(move || {
+        let empty = Arc::new(Vec::new());
+        let data = |d: Option<DenseId>| match d {
+            Some(d) => blobs.get(&d).cloned().context("blob not read"),
+            None => Ok(empty.clone()),
+        };
+        chunk
+            .into_iter()
+            .map(|read| {
+                let (before, after) = (data(read.old)?, data(read.new)?);
+                Ok((
+                    read.change,
+                    content(&before, &after, want_hunks, read.sketch),
+                ))
+            })
+            .collect::<Result<Vec<_>>>()
+    })
+    .await
+    .context("diff content task")??;
+    for (index, computed) in computed {
+        let Some(change) = changes.get_mut(index) else {
+            continue;
+        };
+        match computed {
+            Some((hunks, sketch)) => {
+                change.hunks = hunks;
+                change.sketch = sketch;
+            }
+            None => change.content_skipped = true,
+        }
+    }
+    Ok(())
+}
+
+/// The hunks and sketch of one change's blobs, or `None` when either is not
+/// text. An empty side is an added or deleted file.
+fn content(
+    before: &[u8],
+    after: &[u8],
+    want_hunks: bool,
+    sketch: Option<usize>,
+) -> Option<(Vec<Hunk>, Option<LineSketch>)> {
+    if !diff_content::is_text(before) || !diff_content::is_text(after) {
+        return None;
+    }
+    let hunks = if want_hunks {
+        diff_content::line_hunks(before, after)
+    } else {
+        Vec::new()
+    };
+    let sketched = if after.is_empty() { before } else { after };
+    Some((
+        hunks,
+        sketch.map(|k| diff_content::line_sketch(sketched, k)),
+    ))
 }
 
 /// The root tree of a stored commit.
@@ -550,11 +781,13 @@ async fn diff_trees(
     snap: &Arc<Snapshot>,
     old_root: Option<Oid>,
     new_root: Oid,
+    filter: Option<Arc<PathFilter>>,
 ) -> Result<TreeDiff> {
     let mut read: HashMap<Oid, Vec<Child>> = HashMap::new();
     loop {
+        let filter = filter.clone();
         let (diff, back) = tokio::task::spawn_blocking(move || {
-            let diff = diff_pass(&read, old_root, new_root);
+            let diff = diff_pass(&read, old_root, new_root, filter.as_deref());
             (diff, read)
         })
         .await?;
@@ -568,7 +801,12 @@ async fn diff_trees(
 
 /// One pass: every path that differs under the trees in `read`, removals
 /// included, and the trees it could not descend into.
-fn diff_pass(read: &HashMap<Oid, Vec<Child>>, old_root: Option<Oid>, new_root: Oid) -> TreeDiff {
+fn diff_pass(
+    read: &HashMap<Oid, Vec<Child>>,
+    old_root: Option<Oid>,
+    new_root: Oid,
+    filter: Option<&PathFilter>,
+) -> TreeDiff {
     let mut out = TreeDiff::default();
     if old_root == Some(new_root) {
         return out;
@@ -604,9 +842,9 @@ fn diff_pass(read: &HashMap<Oid, Vec<Child>>, old_root: Option<Oid>, new_root: O
             let path = join(&prefix, &entry.name);
             let old_oid = was.filter(|w| w.is_tree == entry.is_tree).map(|w| w.oid);
             if let Some(gone) = was.filter(|w| w.is_tree != entry.is_tree) {
-                removed(&mut out, &mut stack, path.clone(), gone);
+                removed(&mut out, &mut stack, path.clone(), gone, filter);
             }
-            if entry.is_tree {
+            if entry.is_tree && filter.is_none_or(|f| f.has_under(&path)) {
                 stack.push((path.clone(), old_oid, Some(entry.oid)));
             }
             out.changes.push((path, entry.is_tree, old_oid, entry.oid));
@@ -614,7 +852,13 @@ fn diff_pass(read: &HashMap<Oid, Vec<Child>>, old_root: Option<Oid>, new_root: O
         let mut gone: Vec<&Child> = previous.into_values().collect();
         gone.sort_by(|a, b| a.name.cmp(&b.name));
         for entry in gone {
-            removed(&mut out, &mut stack, join(&prefix, &entry.name), entry);
+            removed(
+                &mut out,
+                &mut stack,
+                join(&prefix, &entry.name),
+                entry,
+                filter,
+            );
         }
     }
     let mut named = HashSet::new();
@@ -628,21 +872,30 @@ fn removed(
     stack: &mut Vec<(Vec<u8>, Option<Oid>, Option<Oid>)>,
     path: Vec<u8>,
     entry: &Child,
+    filter: Option<&PathFilter>,
 ) {
-    if entry.is_tree {
+    if entry.is_tree && filter.is_none_or(|f| f.has_under(&path)) {
         stack.push((path.clone(), Some(entry.oid), None));
     }
     out.removals.push((path, entry.is_tree, entry.oid));
 }
 
-/// The files of a diff, sorted, then cut at the change limit.
-fn changed_files(diff: TreeDiff) -> CommitDiff {
+/// A file a diff found changed, before its blobs are read.
+struct ChangedPath {
+    path: Vec<u8>,
+    old: Option<Oid>,
+    new: Option<Oid>,
+}
+
+/// The files of a diff that `filter` keeps, sorted, then cut at the change
+/// limit, and whether the cut or an unread tree left some out.
+fn changed_files(diff: TreeDiff, filter: Option<&PathFilter>) -> (Vec<ChangedPath>, bool) {
     let complete = diff.unreadable.is_empty();
     let added = diff
         .changes
         .into_iter()
         .filter(|(_, is_tree, _, _)| !is_tree)
-        .map(|(path, _, old, new)| FileChange {
+        .map(|(path, _, old, new)| ChangedPath {
             path,
             old,
             new: Some(new),
@@ -651,17 +904,20 @@ fn changed_files(diff: TreeDiff) -> CommitDiff {
         .removals
         .into_iter()
         .filter(|(_, is_tree, _)| !is_tree)
-        .map(|(path, _, old)| FileChange {
+        .map(|(path, _, old)| ChangedPath {
             path,
             old: Some(old),
             new: None,
         });
-    let mut changes: Vec<FileChange> = added.chain(gone).collect();
+    let mut changes: Vec<ChangedPath> = added
+        .chain(gone)
+        .filter(|change| filter.is_none_or(|f| f.has_file(&change.path)))
+        .collect();
     // The API sends paths as strings, and sorted them as strings.
     changes.sort_by_cached_key(|c| String::from_utf8_lossy(&c.path).into_owned());
     let truncated = changes.len() > DIFF_CHANGE_LIMIT || !complete;
     changes.truncate(DIFF_CHANGE_LIMIT);
-    CommitDiff { changes, truncated }
+    (changes, truncated)
 }
 
 /// `name` under `prefix`.
