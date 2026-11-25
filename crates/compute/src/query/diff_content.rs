@@ -108,3 +108,49 @@ fn line_offsets(bytes: &[u8]) -> Vec<usize> {
     }
     offsets
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn any_text() -> impl proptest::strategy::Strategy<Value = Vec<u8>> {
+        use proptest::prelude::*;
+        // Few distinct lines, so the texts share many and repeat some.
+        let line = proptest::sample::select(vec!["a\n", "b\n", "c\n", "\n", "a"]);
+        proptest::collection::vec(line, 0..30).prop_map(|lines| lines.concat().into_bytes())
+    }
+
+    proptest::proptest! {
+        /// Hunks are ordered whole lines, and the old text with each replaced
+        /// is the new text.
+        #[test]
+        fn hunks_rebuild_the_new_text(before in any_text(), after in any_text()) {
+            let starts_line = |text: &[u8], at: u64| {
+                let at = usize::try_from(at).unwrap();
+                at == 0 || at == text.len() || text.get(at - 1) == Some(&b'\n')
+            };
+            let slice = |text: &[u8], range: Range<u64>| {
+                text[usize::try_from(range.start).unwrap()..usize::try_from(range.end).unwrap()]
+                    .to_vec()
+            };
+            let mut rebuilt = Vec::new();
+            let (mut old_end, mut new_end) = (0, 0);
+            for hunk in line_hunks(&before, &after) {
+                for at in [hunk.old.start, hunk.old.end] {
+                    proptest::prop_assert!(starts_line(&before, at));
+                }
+                for at in [hunk.new.start, hunk.new.end] {
+                    proptest::prop_assert!(starts_line(&after, at));
+                }
+                proptest::prop_assert!(old_end <= hunk.old.start && hunk.old.start <= hunk.old.end);
+                proptest::prop_assert!(new_end <= hunk.new.start && hunk.new.start <= hunk.new.end);
+                proptest::prop_assert_eq!(hunk.old.start - old_end, hunk.new.start - new_end);
+                rebuilt.extend(slice(&before, old_end..hunk.old.start));
+                rebuilt.extend(slice(&after, hunk.new.clone()));
+                (old_end, new_end) = (hunk.old.end, hunk.new.end);
+            }
+            rebuilt.extend(slice(&before, old_end..u64::try_from(before.len()).unwrap()));
+            proptest::prop_assert_eq!(rebuilt, after);
+        }
+    }
+}

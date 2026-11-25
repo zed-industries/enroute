@@ -14,6 +14,7 @@ mod commit;
 mod diff_content;
 mod refs;
 
+use std::cmp::Ordering;
 use std::collections::BTreeSet;
 use std::ops::Bound;
 
@@ -354,7 +355,6 @@ pub(crate) async fn list_tree(
     let root = root_tree(snap, start).await?;
     // An empty `start_after` starts before every path, at depth 0.
     let start_depth = start_after.matches('/').count();
-    let mut trees: HashMap<Oid, Vec<Child>> = HashMap::new();
     let mut walk = TreeListing::default();
     let mut named = 0usize;
     let mut directories: Vec<(Vec<u8>, Oid)> = vec![(Vec::new(), root)];
@@ -365,52 +365,91 @@ pub(crate) async fn list_tree(
         let unread: Vec<Oid> = directories
             .iter()
             .map(|(_, oid)| *oid)
-            .filter(|oid| !trees.contains_key(oid))
             .collect::<HashSet<_>>()
             .into_iter()
             .collect();
+        // Only this depth's trees are held, so a page deep in a large tree
+        // does not keep every tree above it.
+        let mut trees = HashMap::new();
         read_trees(snap, &unread, &mut trees).await?;
-        let mut entries: Vec<(String, TreeItem)> = directories
-            .iter()
-            .filter_map(|(prefix, oid)| Some((prefix, trees.get(oid)?)))
-            .flat_map(|(prefix, children)| {
-                children.iter().filter(|c| !c.is_commit).map(|c| {
-                    let path = join(prefix, &c.name);
-                    let item = TreeItem {
-                        path,
-                        oid: c.oid,
-                        is_tree: c.is_tree,
-                    };
-                    (String::from_utf8_lossy(&item.path).into_owned(), item)
-                })
+        let sort = depth >= start_depth;
+        let entries;
+        (entries, directories) =
+            tokio::task::spawn_blocking(move || depth_entries(&directories, &trees, sort))
+                .await
+                .map_err(anyhow::Error::from)?;
+        let mut listed = entries
+            .into_iter()
+            .filter(|item| {
+                depth > start_depth
+                    || depth == start_depth && lossy_cmp(&item.path, start_after.as_bytes()).is_gt()
             })
-            .collect();
-        entries.sort_by(|(left, _), (right, _)| left.cmp(right));
-        directories = entries
-            .iter()
-            .filter(|(_, item)| item.is_tree)
-            .map(|(_, item)| (item.path.clone(), item.oid))
-            .collect();
-        let listed = entries.into_iter().filter(|(key, _)| {
-            depth > start_depth || depth == start_depth && key.as_str() > start_after
-        });
-        let mut level = Vec::new();
-        let mut last: Option<String> = None;
-        for (key, item) in listed {
-            if named >= TREE_ENTRY_LIMIT && last.as_ref() != Some(&key) {
-                walk.levels.push(level);
-                walk.truncated = true;
-                return Ok(walk);
-            }
+            .peekable();
+        let mut level: Vec<TreeItem> = Vec::new();
+        while let Some(item) = listed.next_if(|item| {
+            named < TREE_ENTRY_LIMIT
+                || level
+                    .last()
+                    .is_some_and(|last| lossy_cmp(&last.path, &item.path).is_eq())
+        }) {
             named += 1;
             level.push(item);
-            last = Some(key);
         }
+        let truncated = listed.peek().is_some();
         if !level.is_empty() {
             walk.levels.push(level);
         }
+        if truncated {
+            walk.truncated = true;
+            return Ok(walk);
+        }
     }
     Ok(walk)
+}
+
+/// The entries in `directories`, sorted by path when `sort` is set, and the
+/// directories among them.
+fn depth_entries(
+    directories: &[(Vec<u8>, Oid)],
+    trees: &HashMap<Oid, Vec<Child>>,
+    sort: bool,
+) -> (Vec<TreeItem>, Vec<(Vec<u8>, Oid)>) {
+    let mut entries: Vec<TreeItem> = directories
+        .iter()
+        .filter_map(|(prefix, oid)| Some((prefix, trees.get(oid)?)))
+        .flat_map(|(prefix, children)| {
+            children.iter().filter(|c| !c.is_commit).map(|c| TreeItem {
+                path: join(prefix, &c.name),
+                oid: c.oid,
+                is_tree: c.is_tree,
+            })
+        })
+        .collect();
+    if sort {
+        entries.sort_by(|left, right| lossy_cmp(&left.path, &right.path));
+    }
+    let below = entries
+        .iter()
+        .filter(|item| item.is_tree)
+        .map(|item| (item.path.clone(), item.oid))
+        .collect();
+    (entries, below)
+}
+
+/// Orders paths as the API sends them, decoded lossily, without allocating.
+fn lossy_cmp(left: &[u8], right: &[u8]) -> Ordering {
+    match (std::str::from_utf8(left), std::str::from_utf8(right)) {
+        (Ok(_), Ok(_)) => left.cmp(right),
+        _ => lossy_chars(left).cmp(lossy_chars(right)),
+    }
+}
+
+/// The chars of `String::from_utf8_lossy(bytes)`.
+fn lossy_chars(bytes: &[u8]) -> impl Iterator<Item = char> + '_ {
+    bytes.utf8_chunks().flat_map(|chunk| {
+        let invalid = (!chunk.invalid().is_empty()).then_some(char::REPLACEMENT_CHARACTER);
+        chunk.valid().chars().chain(invalid)
+    })
 }
 
 /// The tree a listing starts at.
@@ -1039,4 +1078,34 @@ pub async fn pack_for_push(
         snap: snap.clone(),
         plan,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    proptest::proptest! {
+        /// Paths sort as their lossy decodings do, which is what the API sends.
+        #[test]
+        fn paths_sort_as_they_are_sent(
+            left in proptest::collection::vec(proptest::sample::select(b"a/\xc3\xa9\x80\xff".to_vec()), 0..8),
+            right in proptest::collection::vec(proptest::sample::select(b"a/\xc3\xa9\x80\xff".to_vec()), 0..8),
+        ) {
+            proptest::prop_assert_eq!(
+                lossy_cmp(&left, &right),
+                String::from_utf8_lossy(&left).cmp(&String::from_utf8_lossy(&right)),
+            );
+        }
+
+        /// A directory holds a filtered path when one starts with it and `/`.
+        #[test]
+        fn a_directory_holds_the_paths_under_it(
+            paths in proptest::collection::vec(proptest::string::string_regex("[ab.-]{1,2}(/[ab.-]{1,2}){0,2}").unwrap(), 0..8),
+            directory in proptest::string::string_regex("[ab.-]{1,2}(/[ab.-]{1,2})?").unwrap(),
+        ) {
+            let filter = PathFilter::new(paths.iter().map(|path| path.clone().into_bytes()));
+            let under = paths.iter().any(|path| path.starts_with(&format!("{directory}/")));
+            proptest::prop_assert_eq!(filter.has_under(directory.as_bytes()), under);
+        }
+    }
 }
